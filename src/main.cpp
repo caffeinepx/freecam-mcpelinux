@@ -1,0 +1,2024 @@
+#include <EGL/egl.h>
+#include <android/log.h>
+#include <dlfcn.h>
+#include <link.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
+
+#ifndef __NR_mincore
+#define __NR_mincore 27
+#endif
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "Freecam", __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "Freecam", __VA_ARGS__)
+
+static constexpr int kKeyV = 86;
+static constexpr int kKeyW = 87;
+static constexpr int kKeyA = 65;
+static constexpr int kKeyS = 83;
+static constexpr int kKeyD = 68;
+static constexpr int kKeySpace = 32;
+static constexpr int kKeyShift = 16;
+static constexpr int kActionPress = 0;
+static constexpr int kActionRepeat = 1;
+static constexpr int kActionRelease = 2;
+static constexpr uintptr_t kVtMovePlayer = 0x161667f8;
+static constexpr uintptr_t kVtAuthInput = 0x161f1538;
+static constexpr uintptr_t kTickWorldRva = 0xbcd8d00;
+static constexpr uintptr_t kSetGameTypeRva = 0xbcd0090;
+static constexpr int kGetLocalPlayerSlot = 32;
+static constexpr int kGameTypeSurvival = 0;
+static constexpr int kGameTypeSpectator = 6;
+
+struct Vec3 {
+    float x = 0, y = 0, z = 0;
+};
+
+struct MenuEntryABI {
+    const char* name;
+    void* user;
+    bool (*selected)(void* user);
+    void (*click)(void* user);
+    size_t length;
+    MenuEntryABI* subentries;
+};
+
+struct Control {
+    int type;
+    union {
+        struct {
+            const char* label;
+            void* user;
+            void (*onClick)(void* user);
+        } button;
+        struct {
+            const char* label;
+            int min;
+            int def;
+            int max;
+            void* user;
+            void (*onChange)(void* user, int value);
+        } sliderint;
+        struct {
+            const char* label;
+            float min;
+            float def;
+            float max;
+            void* user;
+            void (*onChange)(void* user, float value);
+        } sliderfloat;
+        struct {
+            char* label;
+            int size;
+        } text;
+    } data;
+};
+
+struct MemRange {
+    std::byte* data;
+    size_t size;
+};
+
+static bool (*game_window_is_mouse_locked)(void* window);
+static void (*game_window_add_window_creation_callback)(void* user, void (*callback)(void* user));
+static void* (*game_window_get_primary_window)();
+static void (*game_window_add_keyboard_callback)(void* window, void* user,
+                                                 bool (*callback)(void* user, int keyCode, int action));
+
+static void (*mcpelauncher_show_window)(const char* title, int isModal, void* user, void (*onClose)(void* user),
+                                        int count, Control* controls);
+static void (*mcpelauncher_close_window)(const char* title);
+static void (*mcpelauncher_addmenu)(size_t length, MenuEntryABI* entries);
+
+static unsigned long (*CameraAPI_tryGetFOV_orig)(void*);
+static void (*PacketSender_send_orig)(void*, void*, void*, void*, void*, void*);
+static void* (*LocalPlayer_tick_orig)(void*, void*, void*, void*, void*, void*);
+static void* (*LocalPlayer_s12_orig)(void*, void*, void*, void*, void*, void*);
+static void (*LocalPlayer_setGT_orig)(void*, int, void*, void*, void*);
+
+static int g_key = kKeyV;
+static float g_speed = 12.0f;
+
+static bool g_enabled = false;
+static bool g_rebinding = false;
+static bool g_have_player = false;
+static bool g_pkt_hooked = false;
+static bool g_lp_hooked = false;
+static bool g_abilities_on = false;
+static bool g_spectator_on = false;
+static int g_saved_gametype = 0;
+static bool g_move_w = false, g_move_a = false, g_move_s = false, g_move_d = false;
+static bool g_move_up = false, g_move_down = false;
+static Vec3 g_pos{};
+static Vec3 g_saved_pos{};
+static Vec3 g_saved_aabb_min{};
+static Vec3 g_saved_aabb_max{};
+static float g_yaw = 0.0f;
+static float g_pitch = 0.0f;
+static void* g_player = nullptr;
+static void* g_client = nullptr;
+static void** g_local_player_vt = nullptr;
+static uintptr_t g_mc_base = 0;
+static int g_pos_off = -1;
+static std::byte* g_sv_obj = nullptr;
+static int g_aabb_off = -1;
+static std::byte* g_aabb_obj = nullptr;
+static int g_rot_off = -1;
+static std::byte* g_rot_obj = nullptr;
+static std::byte* g_cam = nullptr;
+static int g_cam_pos_off = -1;
+static int g_cam_fwd_off = -1;
+static int g_cam_right_off = -1;
+static int g_cam_znear_off = -1;
+static float g_saved_znear = 0.05f;
+static bool g_cam_can_write = false;
+static bool g_cam_known_814 = false;
+static float g_eye_y = 1.62f;
+static void* g_camera_api = nullptr;
+static void* g_renderer = nullptr;
+static std::byte* g_ability_base = nullptr;
+static std::byte g_saved_ability[3][12]{};
+static char g_key_label[128];
+static int g_logged = 0;
+static bool g_ability_search_failed = false;
+static double g_next_ability_scan = 0.0;
+static std::byte* g_mac = nullptr;
+static uint32_t g_saved_mac_over = 0;
+static uint32_t g_saved_mac_flags = 0;
+static float g_saved_mac_fly[2] = {0.05f, 1.0f};
+static bool g_mac_on = false;
+static int g_saved_layer_count = 0;
+static std::byte* g_saved_layer_ptr[6]{};
+static std::byte g_saved_layer_bytes[6][240]{};
+
+static constexpr uint32_t kMacFlying = 1u << 0;
+static constexpr uint32_t kMacMayFly = 1u << 1;
+static constexpr uint32_t kMacIgnoreBorder = 1u << 3;
+static constexpr uint32_t kMacNoClip = 1u << 4;
+static constexpr uint32_t kMacNoclipMask = kMacFlying | kMacMayFly | kMacIgnoreBorder | kMacNoClip;
+
+static std::vector<MemRange> g_readable;
+static std::vector<MemRange> g_writable;
+static std::vector<MemRange> g_maps;
+
+static void** find_primary_vtable(const char* typeinfo_name);
+static bool protect_slot(void** fn_slot);
+static bool bind_player_fields(void* player);
+static void flatten_aabb(void* player);
+static void write_player_pos(void* player, Vec3 pos);
+static void* find_local_player(void* start);
+static bool find_game_camera(void* api);
+static bool layer_looks_valid(std::byte* layer);
+static bool approx_f(float a, float b);
+static bool player_still_ok();
+static bool looks_like_player(void* p);
+static void* scan_for_local_player(void* obj, int max_off);
+static void consider_player(void* p);
+
+static double now_sec() {
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) / 1e9;
+}
+
+static std::string config_path() {
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<void*>(&config_path), &info) && info.dli_fname) {
+        std::string path = info.dli_fname;
+        auto slash = path.find_last_of('/');
+        if (slash != std::string::npos) {
+            return path.substr(0, slash + 1) + "freecam.conf";
+        }
+    }
+    return "/data/data/com.mojang.minecraftpe/freecam.conf";
+}
+
+static std::string key_name(int key) {
+    if ((key >= 65 && key <= 90) || (key >= 48 && key <= 57)) {
+        return std::string(1, static_cast<char>(key));
+    }
+    if (key == 32) {
+        return "SPACE";
+    }
+    if (key == 16 || key == 160 || key == 161) {
+        return "SHIFT";
+    }
+    return "KEY_" + std::to_string(key);
+}
+
+static bool playing() {
+    void* window = game_window_get_primary_window ? game_window_get_primary_window() : nullptr;
+    return window && game_window_is_mouse_locked && game_window_is_mouse_locked(window);
+}
+
+static void save_config() {
+    FILE* out = fopen(config_path().c_str(), "w");
+    if (!out) {
+        return;
+    }
+    std::fprintf(out, "key=%d\nspeed=%.4f\n", g_key, g_speed);
+    fclose(out);
+}
+
+static void load_config() {
+    FILE* in = fopen(config_path().c_str(), "r");
+    if (!in) {
+        return;
+    }
+    char line[128];
+    while (fgets(line, sizeof(line), in)) {
+        if (!std::strncmp(line, "key=", 4)) {
+            g_key = std::atoi(line + 4);
+        } else if (!std::strncmp(line, "speed=", 6)) {
+            g_speed = std::strtof(line + 6, nullptr);
+        }
+    }
+    fclose(in);
+    g_speed = std::clamp(g_speed, 0.5f, 80.0f);
+    if (g_key <= 0) {
+        g_key = kKeyV;
+    }
+}
+
+static bool looks_like_pos(float x, float y, float z) {
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+        return false;
+    }
+    if (y < -64.f || y > 512.f) {
+        return false;
+    }
+    if (std::fabs(x) > 3.0e7f || std::fabs(z) > 3.0e7f) {
+        return false;
+    }
+    if (std::fabs(x) < 8.f && std::fabs(y) < 16.f && std::fabs(z) < 8.f) {
+        return false;
+    }
+    return true;
+}
+
+static void refresh_maps() {
+    g_maps.clear();
+    FILE* maps = fopen("/proc/self/maps", "r");
+    if (!maps) {
+        return;
+    }
+    char line[256];
+    while (fgets(line, sizeof(line), maps)) {
+        unsigned long start = 0, end = 0;
+        char perms[8] = {};
+        if (std::sscanf(line, "%lx-%lx %7s", &start, &end, perms) != 3) {
+            continue;
+        }
+        if (perms[0] != 'r' || end <= start) {
+            continue;
+        }
+        g_maps.push_back({reinterpret_cast<std::byte*>(start), static_cast<size_t>(end - start)});
+    }
+    fclose(maps);
+    std::sort(g_maps.begin(), g_maps.end(),
+              [](const MemRange& a, const MemRange& b) { return a.data < b.data; });
+}
+
+static bool page_mapped(const void* p) {
+    if (!p) {
+        return false;
+    }
+    unsigned char vec = 0;
+    auto page = reinterpret_cast<uintptr_t>(p) & ~static_cast<uintptr_t>(0xfff);
+    long rc = syscall(__NR_mincore, reinterpret_cast<void*>(page), 4096, &vec);
+    if (rc == 0 && (vec & 1) != 0) {
+        return true;
+    }
+    if (g_maps.empty()) {
+        refresh_maps();
+    }
+    auto u = reinterpret_cast<uintptr_t>(p);
+    auto it = std::upper_bound(g_maps.begin(), g_maps.end(), u, [](uintptr_t addr, const MemRange& r) {
+        return addr < reinterpret_cast<uintptr_t>(r.data);
+    });
+    if (it == g_maps.begin()) {
+        return false;
+    }
+    --it;
+    auto b = reinterpret_cast<uintptr_t>(it->data);
+    return u >= b && u < b + it->size;
+}
+
+static bool heap_ptr_ok(const void* p, size_t nbytes = 16) {
+    auto u = reinterpret_cast<uintptr_t>(p);
+    if (u < 0x10000 || u > 0x00007fffffffffffULL) {
+        return false;
+    }
+    if ((u & 7u) != 0) {
+        return false;
+    }
+    if (nbytes > 0x10000) {
+        return false;
+    }
+    if (!page_mapped(p)) {
+        return false;
+    }
+    if (nbytes > 1 && !page_mapped(static_cast<const std::byte*>(p) + nbytes - 1)) {
+        return false;
+    }
+    return true;
+}
+
+static bool in_mc(const void* p) {
+    auto* b = static_cast<const std::byte*>(p);
+    for (auto range : g_readable) {
+        if (b >= range.data && b < range.data + range.size) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static float read_f(const std::byte* p) {
+    float v = 0;
+    std::memcpy(&v, p, 4);
+    return v;
+}
+
+static void write_f(std::byte* p, float v) {
+    std::memcpy(p, &v, 4);
+}
+
+static Vec3 read_vec3(std::byte* base, int off) {
+    return {read_f(base + off), read_f(base + off + 4), read_f(base + off + 8)};
+}
+
+static void write_vec3(std::byte* base, int off, Vec3 v) {
+    write_f(base + off, v.x);
+    write_f(base + off + 4, v.y);
+    write_f(base + off + 8, v.z);
+}
+
+static const char* type_name(void* obj) {
+    if (!obj || !heap_ptr_ok(obj, 8)) {
+        return nullptr;
+    }
+    void** vt = *reinterpret_cast<void***>(obj);
+    if (!vt || !in_mc(vt)) {
+        return nullptr;
+    }
+    void* ti = vt[-1];
+    if (!ti || !in_mc(ti)) {
+        return nullptr;
+    }
+    const char* name = *reinterpret_cast<const char**>(static_cast<std::byte*>(ti) + sizeof(void*));
+    if (!name || !in_mc(name)) {
+        return nullptr;
+    }
+    return name;
+}
+
+static bool type_is(void* obj, const char* want) {
+    const char* n = type_name(obj);
+    return n && std::strcmp(n, want) == 0;
+}
+
+static bool vec_close(Vec3 a, Vec3 b) {
+    return std::fabs(a.x - b.x) < 0.02f && std::fabs(a.y - b.y) < 0.02f && std::fabs(a.z - b.z) < 0.02f;
+}
+
+static bool locate_vec3(void* obj, int max_off, Vec3 want, int* out_off) {
+    if (!obj) {
+        return false;
+    }
+    auto* base = static_cast<std::byte*>(obj);
+    for (int off = 0; off + 12 <= max_off; off += 4) {
+        if (!heap_ptr_ok(obj, static_cast<size_t>(off) + 12)) {
+            continue;
+        }
+        Vec3 v = read_vec3(base, off);
+        if (vec_close(v, want)) {
+            *out_off = off;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool bind_pos_at(void* obj, int off) {
+    if (!obj || off < 0) {
+        return false;
+    }
+    g_sv_obj = static_cast<std::byte*>(obj);
+    g_pos_off = off;
+    g_pos = read_vec3(g_sv_obj, off);
+    if (g_enabled) {
+        g_saved_pos = g_pos;
+    }
+    LOGI("Live pos at %p+0x%x (%.2f %.2f %.2f)", obj, off, g_pos.x, g_pos.y, g_pos.z);
+    return true;
+}
+
+static bool pos_bind_live() {
+    if (!g_sv_obj || g_pos_off < 0 || !heap_ptr_ok(g_sv_obj, static_cast<size_t>(g_pos_off) + 36)) {
+        return false;
+    }
+    Vec3 v = read_vec3(g_sv_obj, g_pos_off);
+    if (!looks_like_pos(v.x, v.y, v.z)) {
+        return false;
+    }
+    g_pos = v;
+    return true;
+}
+
+static bool rebind_pos(void* player) {
+    if (pos_bind_live()) {
+        if (g_enabled) {
+            g_saved_pos = g_pos;
+        }
+        LOGI("Kept pos at %p+0x%x (%.2f %.2f %.2f)", static_cast<void*>(g_sv_obj), g_pos_off, g_pos.x, g_pos.y,
+             g_pos.z);
+        return true;
+    }
+    g_sv_obj = nullptr;
+    g_pos_off = -1;
+    if (!player || !heap_ptr_ok(player, 0x210)) {
+        return false;
+    }
+    void* sv = *reinterpret_cast<void**>(static_cast<std::byte*>(player) + 0x208);
+    if (sv && heap_ptr_ok(sv, 36)) {
+        Vec3 v = read_vec3(static_cast<std::byte*>(sv), 0);
+        if (looks_like_pos(v.x, v.y, v.z)) {
+            return bind_pos_at(sv, 0);
+        }
+    }
+    return false;
+}
+
+static void find_aabb_for_pos(void* player, Vec3 pos) {
+    if (!player || g_aabb_off >= 0) {
+        return;
+    }
+    auto consider = [&](void* obj, int off, Vec3 mn, Vec3 mx) {
+        g_aabb_obj = static_cast<std::byte*>(obj);
+        g_aabb_off = off;
+        g_saved_aabb_min = mn;
+        g_saved_aabb_max = mx;
+        LOGI("AABB at %p+0x%x (%.2f..%.2f)", obj, off, mn.y, mx.y);
+    };
+    auto scan = [&](void* obj, int max_off) {
+        if (!obj || g_aabb_off >= 0) {
+            return;
+        }
+        auto* base = static_cast<std::byte*>(obj);
+        for (int off = 0; off + 32 <= max_off; off += 4) {
+            if (!heap_ptr_ok(obj, static_cast<size_t>(off) + 32)) {
+                continue;
+            }
+            Vec3 mn = read_vec3(base, off);
+            Vec3 mx = read_vec3(base, off + 12);
+            float w = read_f(base + off + 24);
+            float h = read_f(base + off + 28);
+            float dx = mx.x - mn.x, dy = mx.y - mn.y, dz = mx.z - mn.z;
+            bool dim_ok = (w > 0.45f && w < 0.9f && h > 1.5f && h < 2.2f);
+            bool box_ok = (dx > 0.2f && dx < 1.4f && dz > 0.2f && dz < 1.4f && dy > 0.8f && dy < 3.2f);
+            if (!box_ok && !dim_ok) {
+                continue;
+            }
+            if (pos.x >= mn.x - 0.5f && pos.x <= mx.x + 0.5f && pos.z >= mn.z - 0.5f && pos.z <= mx.z + 0.5f &&
+                std::fabs(mn.y - pos.y) < 0.4f && pos.y <= mx.y + 0.2f) {
+                consider(obj, off, mn, mx);
+                return;
+            }
+        }
+    };
+    scan(player, 0x3000);
+    if (g_aabb_off >= 0) {
+        return;
+    }
+    auto* base = static_cast<std::byte*>(player);
+    for (int p = 8; p + 8 <= 0x2000 && g_aabb_off < 0; p += 8) {
+        if (!heap_ptr_ok(player, static_cast<size_t>(p) + 8)) {
+            continue;
+        }
+        void* sub = *reinterpret_cast<void**>(base + p);
+        if (!sub || sub == player || !heap_ptr_ok(sub, 32)) {
+            continue;
+        }
+        scan(sub, 128);
+    }
+}
+
+static bool find_pos_on_player(void* player, Vec3 want) {
+    int off = -1;
+    if (locate_vec3(player, 0x2000, want, &off)) {
+        return bind_pos_at(player, off);
+    }
+    auto* base = static_cast<std::byte*>(player);
+    for (int p = 8; p + 8 <= 0xA00; p += 8) {
+        if (!heap_ptr_ok(player, static_cast<size_t>(p) + 8)) {
+            continue;
+        }
+        void* sub = *reinterpret_cast<void**>(base + p);
+        if (!sub || sub == player || !heap_ptr_ok(sub, 48)) {
+            continue;
+        }
+        if (locate_vec3(sub, 0x100, want, &off)) {
+            return bind_pos_at(sub, off);
+        }
+    }
+    return false;
+}
+
+static Vec3 pos_from_packet(void* pkt) {
+    auto* base = static_cast<std::byte*>(pkt);
+    for (int off = 0x10; off + 12 <= 0x200; off += 4) {
+        if (!heap_ptr_ok(pkt, static_cast<size_t>(off) + 12)) {
+            break;
+        }
+        Vec3 v = read_vec3(base, off);
+        if (looks_like_pos(v.x, v.y, v.z)) {
+            return v;
+        }
+    }
+    return {};
+}
+
+static bool is_movement_packet(void* pkt) {
+    if (!g_mc_base || !pkt || !heap_ptr_ok(pkt, 8)) {
+        return false;
+    }
+    void* vt = *reinterpret_cast<void**>(pkt);
+    return vt == reinterpret_cast<void*>(g_mc_base + kVtMovePlayer) ||
+           vt == reinterpret_cast<void*>(g_mc_base + kVtAuthInput);
+}
+
+static void PacketSender_send_hook(void* self, void* pkt, void* a, void* b, void* c, void* d) {
+    if (g_enabled && is_movement_packet(pkt)) {
+        if (!player_still_ok()) {
+            void* p = scan_for_local_player(self, 0x1000);
+            if (!p) {
+                static double last_bfs = 0.0;
+                double t = now_sec();
+                if (t - last_bfs >= 0.25) {
+                    last_bfs = t;
+                    p = find_local_player(self);
+                }
+            }
+            if (looks_like_player(p)) {
+                consider_player(p);
+            }
+        }
+        if (g_player && (g_pos_off < 0 || !g_sv_obj)) {
+            Vec3 pkt_pos = pos_from_packet(pkt);
+            if (looks_like_pos(pkt_pos.x, pkt_pos.y, pkt_pos.z)) {
+                find_pos_on_player(g_player, pkt_pos);
+            }
+        }
+        return;
+    }
+    PacketSender_send_orig(self, pkt, a, b, c, d);
+}
+
+static bool approx_f(float a, float b) {
+    return std::fabs(a - b) < 0.0005f;
+}
+
+static int scan_ability_layer(std::byte* base, int bytes) {
+    for (int off = 0; off + 14 * 12 + 8 < bytes; off += 4) {
+        if (!page_mapped(base + off) || !page_mapped(base + off + 20)) {
+            continue;
+        }
+        float a = read_f(base + off);
+        float b = read_f(base + off + 12);
+        float c = read_f(base + off + 4);
+        float d = read_f(base + off + 16);
+        bool pair = (approx_f(a, 0.05f) && approx_f(b, 0.1f)) || (approx_f(c, 0.05f) && approx_f(d, 0.1f));
+        if (!pair) {
+            continue;
+        }
+        int layer = off - 13 * 12;
+        if (approx_f(c, 0.05f) && approx_f(d, 0.1f)) {
+            layer = off - 13 * 12;
+        } else {
+            layer = off - 13 * 12;
+        }
+        if (layer >= 0) {
+            return layer;
+        }
+    }
+    return -1;
+}
+
+static bool find_abilities(void* player) {
+    if (g_ability_base && layer_looks_valid(g_ability_base)) {
+        return true;
+    }
+    g_ability_base = nullptr;
+    if (!player) {
+        return false;
+    }
+    auto* base = static_cast<std::byte*>(player);
+    int layer = scan_ability_layer(base, 0x4000);
+    if (layer >= 0) {
+        g_ability_base = base + layer;
+        LOGI("Abilities layer at player+0x%x", layer);
+        return true;
+    }
+    for (int off = 8; off + 8 <= 0x2000; off += 8) {
+        if (!heap_ptr_ok(player, static_cast<size_t>(off) + 8)) {
+            continue;
+        }
+        void* p = *reinterpret_cast<void**>(base + off);
+        if (!p || !heap_ptr_ok(p, 240)) {
+            continue;
+        }
+        int inner = scan_ability_layer(static_cast<std::byte*>(p), 1500);
+        if (inner >= 0) {
+            g_ability_base = static_cast<std::byte*>(p) + inner;
+            LOGI("Abilities layer via ptr 0x%x inner 0x%x", off, inner);
+            return true;
+        }
+    }
+    return false;
+}
+
+static void write_ability_bool(std::byte* layer, int index, bool value) {
+    std::byte* a = layer + index * 12;
+    a[0] = static_cast<std::byte>(2);
+    a[4] = static_cast<std::byte>(value ? 1 : 0);
+    a[5] = static_cast<std::byte>(0);
+    a[6] = static_cast<std::byte>(0);
+    a[7] = static_cast<std::byte>(0);
+}
+
+static void write_ability_float(std::byte* layer, int index, float value) {
+    std::byte* a = layer + index * 12;
+    a[0] = static_cast<std::byte>(3);
+    write_f(a + 4, value);
+}
+
+static bool layer_looks_valid(std::byte* layer) {
+    if (!heap_ptr_ok(layer, 240)) {
+        return false;
+    }
+    unsigned char t13 = static_cast<unsigned char>(layer[13 * 12]);
+    unsigned char t14 = static_cast<unsigned char>(layer[14 * 12]);
+    float fly = read_f(layer + 13 * 12 + 4);
+    float walk = read_f(layer + 14 * 12 + 4);
+    if (!std::isfinite(fly) || !std::isfinite(walk)) {
+        return false;
+    }
+    bool types = (t13 == 3 || t13 == 2) && (t14 == 3 || t14 == 2);
+    bool speeds = (fly > 0.001f && fly < 5.f) && (walk > 0.001f && walk < 5.f);
+    return types && speeds;
+}
+
+static bool mac_looks_valid(std::byte* p) {
+    if (!heap_ptr_ok(p, 16)) {
+        return false;
+    }
+    uint32_t over = 0;
+    uint32_t flags = 0;
+    std::memcpy(&over, p, 4);
+    std::memcpy(&flags, p + 4, 4);
+    if (over > 255u || flags > 255u) {
+        return false;
+    }
+    float fly = read_f(p + 8);
+    float vfly = read_f(p + 12);
+    if (!std::isfinite(fly) || !std::isfinite(vfly)) {
+        return false;
+    }
+    return approx_f(fly, 0.05f) &&
+           (approx_f(vfly, 1.0f) || approx_f(vfly, 0.1f) || approx_f(vfly, 0.05f));
+}
+
+static bool find_movement_abilities(void* player) {
+    if (g_mac && mac_looks_valid(g_mac)) {
+        return true;
+    }
+    g_mac = nullptr;
+    if (!player) {
+        return false;
+    }
+    auto consider = [&](std::byte* obj, int bytes) {
+        if (!obj || g_mac) {
+            return;
+        }
+        for (int off = 0; off + 16 <= bytes; off += 4) {
+            if (!heap_ptr_ok(obj, static_cast<size_t>(off) + 16)) {
+                continue;
+            }
+            std::byte* p = obj + off;
+            if (mac_looks_valid(p)) {
+                g_mac = p;
+                uint32_t flags = 0;
+                std::memcpy(&flags, p + 4, 4);
+                LOGI("MovementAbilities at %p (flags=0x%x fly=%.3f v=%.3f)", p, flags, read_f(p + 8),
+                     read_f(p + 12));
+                return;
+            }
+        }
+    };
+    auto* base = static_cast<std::byte*>(player);
+    consider(base, 0x4000);
+    for (int off = 8; off + 8 <= 0x2000 && !g_mac; off += 8) {
+        if (!heap_ptr_ok(player, static_cast<size_t>(off) + 8)) {
+            continue;
+        }
+        void* p = *reinterpret_cast<void**>(base + off);
+        if (!p || p == player || !heap_ptr_ok(p, 16)) {
+            continue;
+        }
+        consider(static_cast<std::byte*>(p), 256);
+    }
+    return g_mac != nullptr;
+}
+
+static float scaled_fly_speed() {
+    return std::clamp(0.05f * (g_speed / 12.0f), 0.01f, 2.0f);
+}
+
+static float scaled_vert_speed() {
+    return std::clamp(1.0f * (g_speed / 12.0f), 0.05f, 8.0f);
+}
+
+static void call_set_gametype(void* player, int gt) {
+    if (!player || !g_mc_base) {
+        return;
+    }
+    auto fn = reinterpret_cast<void (*)(void*, int)>(g_mc_base + kSetGameTypeRva);
+    if (!in_mc(reinterpret_cast<void*>(fn))) {
+        return;
+    }
+    fn(player, gt);
+}
+
+static void apply_spectator(void* player) {
+    (void)player;
+}
+
+static void restore_spectator(void* player) {
+    (void)player;
+    g_spectator_on = false;
+}
+
+static void apply_mac_flags() {
+    if (!g_mac || !heap_ptr_ok(g_mac, 16)) {
+        return;
+    }
+    if (!g_mac_on) {
+        std::memcpy(&g_saved_mac_over, g_mac, 4);
+        std::memcpy(&g_saved_mac_flags, g_mac + 4, 4);
+        g_saved_mac_fly[0] = read_f(g_mac + 8);
+        g_saved_mac_fly[1] = read_f(g_mac + 12);
+        g_mac_on = true;
+        LOGI("Enabled MovementAbilities flying+noclip (was flags=0x%x).", g_saved_mac_flags);
+    }
+    uint32_t over = 0;
+    uint32_t flags = 0;
+    std::memcpy(&over, g_mac, 4);
+    std::memcpy(&flags, g_mac + 4, 4);
+    over |= kMacNoclipMask;
+    flags |= kMacNoclipMask;
+    std::memcpy(g_mac, &over, 4);
+    std::memcpy(g_mac + 4, &flags, 4);
+    write_f(g_mac + 8, scaled_fly_speed());
+    write_f(g_mac + 12, scaled_vert_speed());
+}
+
+static void apply_layered_abilities() {
+    if (!g_ability_base) {
+        return;
+    }
+    float fly = scaled_fly_speed();
+    float vert = scaled_vert_speed();
+    if (!g_abilities_on) {
+        g_saved_layer_count = 0;
+        std::memcpy(g_saved_ability[0], g_ability_base + 9 * 12, 12);
+        std::memcpy(g_saved_ability[1], g_ability_base + 10 * 12, 12);
+        std::memcpy(g_saved_ability[2], g_ability_base + 17 * 12, 12);
+    }
+    for (int i = -5; i <= 5; ++i) {
+        std::byte* layer = g_ability_base + i * 240;
+        if (!layer_looks_valid(layer)) {
+            continue;
+        }
+        if (!g_abilities_on && g_saved_layer_count < 6) {
+            g_saved_layer_ptr[g_saved_layer_count] = layer;
+            std::memcpy(g_saved_layer_bytes[g_saved_layer_count], layer, 240);
+            ++g_saved_layer_count;
+        }
+        write_ability_bool(layer, 9, true);
+        write_ability_bool(layer, 10, true);
+        write_ability_bool(layer, 17, true);
+        write_ability_float(layer, 13, fly);
+        write_ability_float(layer, 19, vert);
+    }
+    if (!g_abilities_on) {
+        g_abilities_on = true;
+        LOGI("Enabled flying + noclip abilities (%d layers).", g_saved_layer_count);
+    }
+}
+
+static void apply_fly_noclip(void* player) {
+    if (!player) {
+        return;
+    }
+    if (g_mac && !g_mac_on && !mac_looks_valid(g_mac)) {
+        g_mac = nullptr;
+    }
+    if (g_ability_base && !layer_looks_valid(g_ability_base)) {
+        g_ability_base = nullptr;
+        g_abilities_on = false;
+    }
+    if (g_mac_on && g_mac) {
+        apply_mac_flags();
+    }
+    if (g_ability_base) {
+        apply_layered_abilities();
+    }
+    if (g_mac_on && g_abilities_on) {
+        return;
+    }
+    double t = now_sec();
+    if (g_ability_search_failed && t < g_next_ability_scan) {
+        return;
+    }
+    if (!g_mac_on) {
+        if (find_movement_abilities(player)) {
+            apply_mac_flags();
+        }
+    }
+    if (!g_abilities_on) {
+        if (find_abilities(player)) {
+            apply_layered_abilities();
+        }
+    }
+    if (!g_mac_on && !g_abilities_on) {
+        g_ability_search_failed = true;
+        g_next_ability_scan = t + 1.0;
+        if (g_logged < 6) {
+            ++g_logged;
+            LOGE("No MovementAbilities / LayeredAbilities yet.");
+        }
+    }
+}
+
+static void restore_fly_noclip(void* /*player*/) {
+    if (g_mac_on && g_mac && heap_ptr_ok(g_mac, 16)) {
+        std::memcpy(g_mac, &g_saved_mac_over, 4);
+        std::memcpy(g_mac + 4, &g_saved_mac_flags, 4);
+        write_f(g_mac + 8, g_saved_mac_fly[0]);
+        write_f(g_mac + 12, g_saved_mac_fly[1]);
+    }
+    g_mac_on = false;
+    if (g_abilities_on) {
+        for (int i = 0; i < g_saved_layer_count; ++i) {
+            if (g_saved_layer_ptr[i] && heap_ptr_ok(g_saved_layer_ptr[i], 240)) {
+                std::memcpy(g_saved_layer_ptr[i], g_saved_layer_bytes[i], 240);
+            }
+        }
+        if (g_saved_layer_count == 0 && g_ability_base && heap_ptr_ok(g_ability_base, 240)) {
+            std::memcpy(g_ability_base + 9 * 12, g_saved_ability[0], 12);
+            std::memcpy(g_ability_base + 10 * 12, g_saved_ability[1], 12);
+            std::memcpy(g_ability_base + 17 * 12, g_saved_ability[2], 12);
+        }
+    }
+    g_abilities_on = false;
+    g_saved_layer_count = 0;
+}
+
+static void note_player(void* player) {
+    if (!player || !heap_ptr_ok(player, 32)) {
+        return;
+    }
+    const char* tn = type_name(player);
+    if (!tn) {
+        return;
+    }
+    bool ok = std::strcmp(tn, "11LocalPlayer") == 0 || std::strcmp(tn, "6Player") == 0 ||
+              std::strstr(tn, "LocalPlayer") != nullptr || std::strstr(tn, "ServerPlayer") != nullptr;
+    if (!ok) {
+        if (g_logged < 8) {
+            ++g_logged;
+            LOGI("tick this ignored type=%s %p", tn, player);
+        }
+        return;
+    }
+    g_player = player;
+    if (g_pos_off < 0) {
+        rebind_pos(player);
+    }
+    if (!g_have_player) {
+        bind_player_fields(player);
+        find_abilities(player);
+        g_have_player = g_player != nullptr;
+        LOGI("Captured LocalPlayer %p pos_off=0x%x", player, g_pos_off);
+    }
+    if (g_enabled) {
+        apply_fly_noclip(player);
+    }
+}
+
+static void* LocalPlayer_tick_hook(void* self, void* a, void* b, void* c, void* d, void* e) {
+    void* ret = LocalPlayer_tick_orig ? LocalPlayer_tick_orig(self, a, b, c, d, e) : nullptr;
+    note_player(self);
+    if (g_enabled) {
+        apply_fly_noclip(self);
+    }
+    return ret;
+}
+
+static void* LocalPlayer_s12_hook(void* self, void* a, void* b, void* c, void* d, void* e) {
+    void* ret = LocalPlayer_s12_orig ? LocalPlayer_s12_orig(self, a, b, c, d, e) : nullptr;
+    note_player(self);
+    if (g_enabled) {
+        apply_spectator(self);
+    }
+    return ret;
+}
+
+static void LocalPlayer_setGT_hook(void* self, int gt, void* a, void* b, void* c) {
+    note_player(self);
+    if (g_enabled) {
+        gt = kGameTypeSpectator;
+    }
+    if (LocalPlayer_setGT_orig) {
+        LocalPlayer_setGT_orig(self, gt, a, b, c);
+    }
+}
+
+static void* call_ptr_getter(void* obj, int slot) {
+    if (!obj || !heap_ptr_ok(obj, 8)) {
+        return nullptr;
+    }
+    void** vt = *reinterpret_cast<void***>(obj);
+    if (!vt || !in_mc(vt)) {
+        return nullptr;
+    }
+    auto fn = reinterpret_cast<void* (*)(void*, void*, void*, void*)>(vt[slot]);
+    if (!fn || !in_mc(reinterpret_cast<void*>(fn))) {
+        return nullptr;
+    }
+    return fn(obj, nullptr, nullptr, nullptr);
+}
+
+static bool looks_like_player(void* p) {
+    const char* n = type_name(p);
+    return n && (std::strcmp(n, "11LocalPlayer") == 0 || std::strstr(n, "LocalPlayer") != nullptr);
+}
+
+static void* scan_for_local_player(void* obj, int max_off) {
+    if (!obj || !heap_ptr_ok(obj, 16)) {
+        return nullptr;
+    }
+    auto* base = static_cast<std::byte*>(obj);
+    for (int off = 8; off + 8 <= max_off; off += 8) {
+        if (!heap_ptr_ok(obj, static_cast<size_t>(off) + 8)) {
+            continue;
+        }
+        void* p = *reinterpret_cast<void**>(base + off);
+        if (looks_like_player(p)) {
+            LOGI("LocalPlayer at %p+0x%x -> %p", obj, off, p);
+            return p;
+        }
+    }
+    return nullptr;
+}
+
+static void* local_player_from_client(void* client) {
+    if (!client) {
+        return nullptr;
+    }
+    void* p = call_ptr_getter(client, kGetLocalPlayerSlot);
+    if (looks_like_player(p)) {
+        LOGI("LocalPlayer via ClientInstance slot %d -> %p", kGetLocalPlayerSlot, p);
+        return p;
+    }
+    p = scan_for_local_player(client, 0x8000);
+    if (p) {
+        return p;
+    }
+    return find_local_player(client);
+}
+
+static void consider_player(void* p) {
+    if (looks_like_player(p)) {
+        note_player(p);
+    }
+}
+
+static void try_hook_local_player() {
+    if (g_lp_hooked) {
+        return;
+    }
+    if (!g_local_player_vt) {
+        g_local_player_vt = find_primary_vtable("11LocalPlayer");
+        LOGI("LocalPlayer vtable=%p", static_cast<void*>(g_local_player_vt));
+    }
+    g_lp_hooked = true;
+}
+
+static void try_hook_packets() {
+    if (g_pkt_hooked) {
+        return;
+    }
+    void** vt = find_primary_vtable("20LoopbackPacketSender");
+    if (!vt) {
+        if (g_logged < 4) {
+            ++g_logged;
+            LOGE("LoopbackPacketSender vtable not found.");
+        }
+        return;
+    }
+    void** fn_slot = vt + 3;
+    if (!protect_slot(fn_slot)) {
+        LOGE("mprotect on LoopbackPacketSender send failed.");
+        return;
+    }
+    void* fn = *fn_slot;
+    if (!fn || !in_mc(fn)) {
+        return;
+    }
+    PacketSender_send_orig = reinterpret_cast<decltype(PacketSender_send_orig)>(fn);
+    *fn_slot = reinterpret_cast<void*>(&PacketSender_send_hook);
+    g_pkt_hooked = true;
+    LOGI("Hooked LoopbackPacketSender::send orig=%p", fn);
+}
+
+static void* client_from_api(void* api) {
+    if (!api || !heap_ptr_ok(api, 16)) {
+        return nullptr;
+    }
+    void* obj = *reinterpret_cast<void**>(static_cast<std::byte*>(api) + 8);
+    if (!obj || !heap_ptr_ok(obj, 8)) {
+        return nullptr;
+    }
+    void** vt = *reinterpret_cast<void***>(obj);
+    if (!vt || !in_mc(vt)) {
+        return nullptr;
+    }
+    return obj;
+}
+
+static void* find_local_player(void* start) {
+    if (!start || !heap_ptr_ok(start, 8)) {
+        return nullptr;
+    }
+    void* queue[160];
+    int qn = 0;
+    int qi = 0;
+    auto enqueue = [&](void* p) {
+        if (!p || qn >= 160 || !heap_ptr_ok(p, 8) || in_mc(p)) {
+            return;
+        }
+        for (int i = 0; i < qn; ++i) {
+            if (queue[i] == p) {
+                return;
+            }
+        }
+        queue[qn++] = p;
+    };
+    enqueue(start);
+    while (qi < qn) {
+        void* obj = queue[qi++];
+        if (type_is(obj, "11LocalPlayer")) {
+            return obj;
+        }
+        auto* base = static_cast<std::byte*>(obj);
+        int limit = (qi == 1) ? 0x2800 : 0x800;
+        for (int off = 0; off + 8 <= limit && qn < 160; off += 8) {
+            if (!heap_ptr_ok(obj, static_cast<size_t>(off) + 8)) {
+                continue;
+            }
+            enqueue(*reinterpret_cast<void**>(base + off));
+        }
+    }
+    return nullptr;
+}
+
+static bool bind_player_fields(void* player) {
+    if (!player || !heap_ptr_ok(player, 0x40)) {
+        return false;
+    }
+    auto* base = static_cast<std::byte*>(player);
+    int best_pos = -1;
+    float best_score = -1.f;
+    const int max_off = 0x1800;
+    for (int off = 0x40; off + 36 <= max_off; off += 4) {
+        if (!heap_ptr_ok(player, off + 36)) {
+            break;
+        }
+        Vec3 v = read_vec3(base, off);
+        if (!looks_like_pos(v.x, v.y, v.z)) {
+            continue;
+        }
+        Vec3 prev = read_vec3(base, off + 12);
+        float dprev = std::fabs(prev.x - v.x) + std::fabs(prev.y - v.y) + std::fabs(prev.z - v.z);
+        Vec3 vel = read_vec3(base, off + 24);
+        bool vel_ok = std::isfinite(vel.x) && std::isfinite(vel.y) && std::isfinite(vel.z) &&
+                      std::fabs(vel.x) < 80.f && std::fabs(vel.y) < 80.f && std::fabs(vel.z) < 80.f;
+        float score = 10.f + (dprev < 8.f ? 20.f : 0.f) + (vel_ok ? 15.f : 0.f);
+        if (score > best_score) {
+            best_score = score;
+            best_pos = off;
+        }
+    }
+    if (best_pos < 0) {
+        return false;
+    }
+    g_aabb_off = -1;
+    g_rot_off = -1;
+    for (int off = 0x40; off + 24 <= max_off; off += 4) {
+        if (off + 24 > best_pos && off < best_pos + 36) {
+            continue;
+        }
+        Vec3 mn = read_vec3(base, off);
+        Vec3 mx = read_vec3(base, off + 12);
+        if (!std::isfinite(mn.x) || !std::isfinite(mx.x)) {
+            continue;
+        }
+        float dx = mx.x - mn.x;
+        float dy = mx.y - mn.y;
+        float dz = mx.z - mn.z;
+        if (dx < 0.2f || dx > 1.2f || dz < 0.2f || dz > 1.2f || dy < 0.8f || dy > 3.2f) {
+            continue;
+        }
+        float cx = (mn.x + mx.x) * 0.5f;
+        float cz = (mn.z + mx.z) * 0.5f;
+        if (std::fabs(cx - g_pos.x) < 1.5f && std::fabs(cz - g_pos.z) < 1.5f && mn.y <= g_pos.y + 0.5f &&
+            mx.y >= g_pos.y - 2.5f) {
+            g_aabb_off = off;
+            g_saved_aabb_min = mn;
+            g_saved_aabb_max = mx;
+            break;
+        }
+    }
+    g_rot_off = -1;
+    g_rot_obj = nullptr;
+    if (g_enabled) {
+        g_saved_pos = g_pos;
+    }
+    LOGI("Player fields pos=0x%x aabb=0x%x rot=0x%x at (%.2f %.2f %.2f)", g_pos_off, g_aabb_off, g_rot_off, g_pos.x,
+         g_pos.y, g_pos.z);
+    return true;
+}
+
+static void flatten_aabb(void* player) {
+    std::byte* base = g_aabb_obj ? g_aabb_obj : static_cast<std::byte*>(player);
+    if (!base || g_aabb_off < 0) {
+        return;
+    }
+    Vec3 c = g_pos;
+    Vec3 mn{c.x - 0.08f, c.y, c.z - 0.08f};
+    Vec3 mx{c.x + 0.08f, c.y + 0.16f, c.z + 0.08f};
+    write_vec3(base, g_aabb_off, mn);
+    write_vec3(base, g_aabb_off + 12, mx);
+}
+
+static void restore_aabb(void* player) {
+    std::byte* base = g_aabb_obj ? g_aabb_obj : static_cast<std::byte*>(player);
+    if (!base || g_aabb_off < 0) {
+        return;
+    }
+    write_vec3(base, g_aabb_off, g_saved_aabb_min);
+    write_vec3(base, g_aabb_off + 12, g_saved_aabb_max);
+}
+
+static void write_player_pos(void* /*player*/, Vec3 pos) {
+    if (!g_sv_obj || g_pos_off < 0) {
+        return;
+    }
+    write_vec3(g_sv_obj, g_pos_off, pos);
+    write_vec3(g_sv_obj, g_pos_off + 12, pos);
+    write_vec3(g_sv_obj, g_pos_off + 24, Vec3{0, 0, 0});
+}
+
+static void read_look(void* player) {
+    std::byte* base = g_rot_obj ? g_rot_obj : static_cast<std::byte*>(player);
+    if (!base || g_rot_off < 0) {
+        return;
+    }
+    float a = read_f(base + g_rot_off);
+    float b = read_f(base + g_rot_off + 4);
+    if (std::isfinite(a) && std::fabs(a) <= 90.f) {
+        g_pitch = a;
+    }
+    if (std::isfinite(b) && std::fabs(b) <= 360.f) {
+        g_yaw = b;
+    }
+}
+
+static bool find_rotation_component(void* player) {
+    if (g_rot_obj && g_rot_off >= 0) {
+        return true;
+    }
+    auto consider = [&](void* obj, int off) {
+        if (!heap_ptr_ok(obj, static_cast<size_t>(off) + 16)) {
+            return false;
+        }
+        auto* base = static_cast<std::byte*>(obj);
+        float pitch = read_f(base + off);
+        float yaw = read_f(base + off + 4);
+        float pp = read_f(base + off + 8);
+        float py = read_f(base + off + 12);
+        if (!std::isfinite(pitch) || !std::isfinite(yaw) || !std::isfinite(pp) || !std::isfinite(py)) {
+            return false;
+        }
+        if (std::fabs(pitch) > 90.f || std::fabs(pp) > 90.f) {
+            return false;
+        }
+        if (std::fabs(yaw) > 360.f || std::fabs(py) > 360.f) {
+            return false;
+        }
+        if (std::fabs(pitch - pp) > 50.f || std::fabs(yaw - py) > 90.f) {
+            return false;
+        }
+        if (off < 16) {
+            return false;
+        }
+        if (std::fabs(pitch) < 0.01f && std::fabs(yaw) < 0.01f && std::fabs(pp) < 0.01f && std::fabs(py) < 0.01f) {
+            return false;
+        }
+        g_rot_obj = base;
+        g_rot_off = off;
+        g_pitch = pitch;
+        g_yaw = yaw;
+        LOGI("Rotation at %p+0x%x pitch=%.1f yaw=%.1f", obj, off, pitch, yaw);
+        return true;
+    };
+    auto scan = [&](void* obj, int max_off) {
+        if (!obj) {
+            return;
+        }
+        for (int off = 16; off + 16 <= max_off && g_rot_off < 0; off += 4) {
+            consider(obj, off);
+        }
+    };
+    if (g_rot_off >= 0 && consider(player, g_rot_off)) {
+        return true;
+    }
+    g_rot_obj = nullptr;
+    g_rot_off = -1;
+    scan(player, 0x800);
+    if (g_rot_off >= 0) {
+        return true;
+    }
+    auto* base = static_cast<std::byte*>(player);
+    for (int p = 8; p + 8 <= 0x1800 && g_rot_off < 0; p += 8) {
+        if (!heap_ptr_ok(player, static_cast<size_t>(p) + 8)) {
+            continue;
+        }
+        void* sub = *reinterpret_cast<void**>(base + p);
+        if (!sub || sub == player || !heap_ptr_ok(sub, 16)) {
+            continue;
+        }
+        scan(sub, 64);
+    }
+    return g_rot_off >= 0;
+}
+
+static bool is_unit_vec(Vec3 v) {
+    if (!std::isfinite(v.x) || !std::isfinite(v.y) || !std::isfinite(v.z)) {
+        return false;
+    }
+    float l2 = v.x * v.x + v.y * v.y + v.z * v.z;
+    return l2 > 0.81f && l2 < 1.21f;
+}
+
+static float dot3(Vec3 a, Vec3 b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+static bool cam_world_pos_ok(Vec3 p) {
+    if (!looks_like_pos(p.x, p.y, p.z)) {
+        return false;
+    }
+    if (g_pos_off < 0) {
+        return true;
+    }
+    if (std::fabs(p.x - g_pos.x) > 6.f || std::fabs(p.z - g_pos.z) > 6.f) {
+        return false;
+    }
+    if (p.y < g_pos.y - 1.f || p.y > g_pos.y + 3.5f) {
+        return false;
+    }
+    return true;
+}
+
+static bool look_from_camera(Vec3* forward, Vec3* right) {
+    if (!g_cam || g_cam_fwd_off < 0 || g_cam_right_off < 0 || g_cam_pos_off < 0) {
+        return false;
+    }
+    if (!heap_ptr_ok(g_cam, static_cast<size_t>(std::max(g_cam_fwd_off, g_cam_pos_off)) + 12)) {
+        return false;
+    }
+    if (!cam_world_pos_ok(read_vec3(g_cam, g_cam_pos_off))) {
+        return false;
+    }
+    Vec3 f = read_vec3(g_cam, g_cam_fwd_off);
+    Vec3 r = read_vec3(g_cam, g_cam_right_off);
+    if (!is_unit_vec(f) || !is_unit_vec(r)) {
+        return false;
+    }
+    *forward = f;
+    *right = r;
+    return true;
+}
+
+static void write_camera_pos(Vec3 pos) {
+    if (!g_cam_can_write || !g_cam || g_cam_pos_off < 0) {
+        return;
+    }
+    if (!heap_ptr_ok(g_cam, static_cast<size_t>(g_cam_pos_off) + 12)) {
+        return;
+    }
+    write_vec3(g_cam, g_cam_pos_off, pos);
+    if (g_cam_znear_off >= 0 && heap_ptr_ok(g_cam, static_cast<size_t>(g_cam_znear_off) + 4)) {
+        float z = read_f(g_cam + g_cam_znear_off);
+        if (z > 0.0005f && z < 0.6f) {
+            g_saved_znear = z;
+            write_f(g_cam + g_cam_znear_off, 0.85f);
+        }
+    }
+}
+
+static bool basis_at(std::byte* obj, int off) {
+    if (!obj || !heap_ptr_ok(obj, static_cast<size_t>(off) + 48)) {
+        return false;
+    }
+    Vec3 right = read_vec3(obj, off);
+    Vec3 up = read_vec3(obj, off + 12);
+    Vec3 fwd = read_vec3(obj, off + 24);
+    if (!is_unit_vec(right) || !is_unit_vec(up) || !is_unit_vec(fwd)) {
+        return false;
+    }
+    if (std::fabs(right.y) > 0.3f || up.y < 0.75f) {
+        return false;
+    }
+    if (std::fabs(dot3(right, up)) > 0.2f || std::fabs(dot3(right, fwd)) > 0.2f ||
+        std::fabs(dot3(up, fwd)) > 0.2f) {
+        return false;
+    }
+    return true;
+}
+
+static void apply_znear() {
+    if (!g_cam || g_cam_znear_off < 0 || !heap_ptr_ok(g_cam, static_cast<size_t>(g_cam_znear_off) + 4)) {
+        return;
+    }
+    float zn = read_f(g_cam + g_cam_znear_off);
+    if (zn > 0.0005f && zn < 0.6f) {
+        g_saved_znear = zn;
+    }
+    if ((zn > 0.0005f && zn < 0.6f) || std::fabs(zn - 0.85f) < 0.01f) {
+        write_f(g_cam + g_cam_znear_off, 0.85f);
+    }
+}
+
+static void refresh_cam_write() {
+    if (!g_cam || g_cam_pos_off < 0 || g_pos_off < 0) {
+        return;
+    }
+    if (!heap_ptr_ok(g_cam, static_cast<size_t>(g_cam_pos_off) + 12)) {
+        return;
+    }
+    Vec3 p = read_vec3(g_cam, g_cam_pos_off);
+    float dy = p.y - g_pos.y;
+    bool xz_ok = std::fabs(p.x - g_pos.x) < 3.f && std::fabs(p.z - g_pos.z) < 3.f;
+    if (g_cam_known_814 && xz_ok) {
+        if (dy > 0.8f && dy < 2.5f) {
+            g_eye_y = dy;
+        }
+        g_cam_can_write = true;
+    } else if (xz_ok && dy > 0.8f && dy < 2.5f) {
+        g_eye_y = dy;
+        g_cam_can_write = true;
+    }
+    apply_znear();
+}
+
+static void bind_camera(std::byte* obj, int off) {
+    g_cam = obj;
+    g_cam_right_off = off;
+    g_cam_fwd_off = off + 24;
+    g_cam_pos_off = off + 36;
+    g_cam_znear_off = off + 56;
+    g_cam_known_814 = (off == 0x814);
+    Vec3 p = read_vec3(obj, off + 36);
+    g_cam_can_write = false;
+    g_eye_y = 1.62f;
+    if (g_pos_off >= 0) {
+        float dy = p.y - g_pos.y;
+        bool xz_ok = std::fabs(p.x - g_pos.x) < 2.f && std::fabs(p.z - g_pos.z) < 2.f;
+        if (xz_ok && dy > 0.8f && dy < 2.5f) {
+            g_eye_y = dy;
+            g_cam_can_write = true;
+        } else if (g_cam_known_814 && xz_ok) {
+            g_cam_can_write = true;
+        }
+    } else if (g_cam_known_814) {
+        g_cam_can_write = true;
+    }
+    float zn = read_f(obj + off + 56);
+    LOGI("Camera basis at %p+0x%x pos=(%.2f %.2f %.2f) eye=%.2f write=%d znear=%.3f known=%d", obj, off, p.x, p.y,
+         p.z, g_eye_y, g_cam_can_write ? 1 : 0, zn, g_cam_known_814 ? 1 : 0);
+    apply_znear();
+}
+
+static bool scan_camera_basis(std::byte* obj, int max_off) {
+    if (!obj) {
+        return false;
+    }
+    for (int off = 0; off + 48 <= max_off; off += 4) {
+        if (!heap_ptr_ok(obj, static_cast<size_t>(off) + 48)) {
+            continue;
+        }
+        Vec3 right = read_vec3(obj, off);
+        Vec3 up = read_vec3(obj, off + 12);
+        Vec3 fwd = read_vec3(obj, off + 24);
+        if (!is_unit_vec(right) || !is_unit_vec(up) || !is_unit_vec(fwd)) {
+            continue;
+        }
+        if (std::fabs(right.y) > 0.3f) {
+            continue;
+        }
+        if (up.y < 0.75f) {
+            continue;
+        }
+        if (std::fabs(dot3(right, up)) > 0.2f || std::fabs(dot3(right, fwd)) > 0.2f ||
+            std::fabs(dot3(up, fwd)) > 0.2f) {
+            continue;
+        }
+        Vec3 p = read_vec3(obj, off + 36);
+        if (!cam_world_pos_ok(p)) {
+            continue;
+        }
+        bind_camera(obj, off);
+        return true;
+    }
+    return false;
+}
+
+static bool find_game_camera(void* api) {
+    if (g_cam && g_cam_pos_off >= 0 && heap_ptr_ok(g_cam, static_cast<size_t>(g_cam_pos_off) + 12) &&
+        is_unit_vec(read_vec3(g_cam, g_cam_fwd_off)) && cam_world_pos_ok(read_vec3(g_cam, g_cam_pos_off))) {
+        return true;
+    }
+    g_cam = nullptr;
+    g_cam_pos_off = -1;
+    g_cam_fwd_off = -1;
+    g_cam_right_off = -1;
+    g_cam_znear_off = -1;
+    g_cam_can_write = false;
+    g_cam_known_814 = false;
+    if (g_pos_off < 0) {
+        return false;
+    }
+    void* client = g_client ? g_client : client_from_api(api);
+    void* renderer = call_ptr_getter(client, 187);
+    g_renderer = renderer;
+    if (renderer && heap_ptr_ok(renderer, 0x428)) {
+        void* cam = *reinterpret_cast<void**>(static_cast<std::byte*>(renderer) + 0x420);
+        if (cam && cam != client && basis_at(static_cast<std::byte*>(cam), 0x814) &&
+            cam_world_pos_ok(read_vec3(static_cast<std::byte*>(cam), 0x838))) {
+            bind_camera(static_cast<std::byte*>(cam), 0x814);
+            return true;
+        }
+    }
+    if (renderer && scan_camera_basis(static_cast<std::byte*>(renderer), 0x1200)) {
+        return true;
+    }
+    if (renderer && heap_ptr_ok(renderer, 0x428)) {
+        void* cam = *reinterpret_cast<void**>(static_cast<std::byte*>(renderer) + 0x420);
+        if (cam && cam != renderer && cam != client && scan_camera_basis(static_cast<std::byte*>(cam), 0x900)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool player_still_ok() {
+    return g_player && heap_ptr_ok(g_player, 32);
+}
+
+static void attach_player(void* api) {
+    if (player_still_ok()) {
+        if (g_pos_off < 0) {
+            rebind_pos(g_player);
+        }
+        apply_fly_noclip(g_player);
+        return;
+    }
+    g_player = nullptr;
+    void* client = client_from_api(api);
+    g_client = client;
+    if (g_logged < 4) {
+        const char* ct = type_name(client);
+        LOGI("api=%p client=%p client_type=%s", api, client, ct ? ct : "?");
+    }
+    consider_player(local_player_from_client(client));
+    if (!g_player) {
+        consider_player(scan_for_local_player(api, 0x400));
+    }
+    if (!g_player) {
+        LOGE("LocalPlayer not found (client=%p slot32=%p).", client,
+             call_ptr_getter(client, kGetLocalPlayerSlot));
+        return;
+    }
+    bind_player_fields(g_player);
+    g_have_player = true;
+    apply_fly_noclip(g_player);
+}
+
+static void clear_move_keys() {
+    g_move_w = g_move_a = g_move_s = g_move_d = false;
+    g_move_up = g_move_down = false;
+}
+
+static void toggle() {
+    g_enabled = !g_enabled;
+    clear_move_keys();
+    if (g_enabled) {
+        g_logged = 0;
+        refresh_maps();
+        g_have_player = player_still_ok();
+        g_abilities_on = false;
+        g_mac_on = false;
+        g_spectator_on = false;
+        g_ability_search_failed = false;
+        g_next_ability_scan = 0.0;
+        g_saved_layer_count = 0;
+        g_cam = nullptr;
+        g_cam_pos_off = -1;
+        g_cam_fwd_off = -1;
+        g_cam_right_off = -1;
+        g_cam_znear_off = -1;
+        g_cam_can_write = false;
+        g_cam_known_814 = false;
+        g_aabb_obj = nullptr;
+        g_aabb_off = -1;
+        g_rot_obj = nullptr;
+        if (player_still_ok()) {
+            rebind_pos(g_player);
+            find_game_camera(g_camera_api);
+            find_rotation_component(g_player);
+            find_aabb_for_pos(g_player, g_pos);
+        } else {
+            g_sv_obj = nullptr;
+            g_pos_off = -1;
+        }
+        LOGI("Freecam ON");
+    } else {
+        if (g_player) {
+            restore_fly_noclip(g_player);
+            restore_aabb(g_player);
+            if (g_sv_obj && g_pos_off >= 0) {
+                write_player_pos(g_player, g_saved_pos);
+            }
+        }
+        if (g_cam && g_cam_znear_off >= 0 && heap_ptr_ok(g_cam, static_cast<size_t>(g_cam_znear_off) + 4)) {
+            write_f(g_cam + g_cam_znear_off, g_saved_znear);
+        }
+        LOGI("Freecam OFF");
+    }
+}
+
+static void tick_move(float dt) {
+    if (!g_enabled || !player_still_ok()) {
+        return;
+    }
+    apply_fly_noclip(g_player);
+    if (g_pos_off < 0 || !g_sv_obj) {
+        return;
+    }
+    if (g_aabb_off < 0) {
+        find_aabb_for_pos(g_player, g_pos);
+    }
+    if (!g_rot_obj) {
+        find_rotation_component(g_player);
+    }
+    if (!g_cam) {
+        find_game_camera(g_camera_api);
+    }
+    refresh_cam_write();
+    Vec3 forward{};
+    Vec3 rightv{};
+    if (!look_from_camera(&forward, &rightv)) {
+        if (g_rot_obj) {
+            read_look(g_player);
+            float yaw_rad = g_yaw * (3.14159265f / 180.f);
+            float sy = std::sin(yaw_rad);
+            float cy = std::cos(yaw_rad);
+            forward = Vec3{sy, 0.f, -cy};
+            rightv = Vec3{cy, 0.f, sy};
+        }
+    }
+    Vec3 flat_f{forward.x, 0.f, forward.z};
+    Vec3 flat_r{rightv.x, 0.f, rightv.z};
+    float fl = std::sqrt(flat_f.x * flat_f.x + flat_f.z * flat_f.z);
+    float rl = std::sqrt(flat_r.x * flat_r.x + flat_r.z * flat_r.z);
+    if (fl > 0.001f) {
+        flat_f.x /= fl;
+        flat_f.z /= fl;
+    }
+    if (rl > 0.001f) {
+        flat_r.x /= rl;
+        flat_r.z /= rl;
+    }
+    Vec3 wish{};
+    if (g_move_w) {
+        wish.x += flat_f.x;
+        wish.z += flat_f.z;
+    }
+    if (g_move_s) {
+        wish.x -= flat_f.x;
+        wish.z -= flat_f.z;
+    }
+    if (g_move_d) {
+        wish.x += flat_r.x;
+        wish.z += flat_r.z;
+    }
+    if (g_move_a) {
+        wish.x -= flat_r.x;
+        wish.z -= flat_r.z;
+    }
+    if (g_move_up) {
+        wish.y += 1.f;
+    }
+    if (g_move_down) {
+        wish.y -= 1.f;
+    }
+    float mag = std::sqrt(wish.x * wish.x + wish.y * wish.y + wish.z * wish.z);
+    if (mag > 0.001f) {
+        float step = g_speed * dt / mag;
+        g_pos.x += wish.x * step;
+        g_pos.y += wish.y * step;
+        g_pos.z += wish.z * step;
+    }
+    flatten_aabb(g_player);
+    write_player_pos(g_player, g_pos);
+    if (g_cam_can_write) {
+        Vec3 eye{g_pos.x, g_pos.y + g_eye_y, g_pos.z};
+        write_camera_pos(eye);
+        if (g_renderer) {
+            for (int off : {0x5e0, 0x61c}) {
+                if (!heap_ptr_ok(g_renderer, static_cast<size_t>(off) + 12)) {
+                    continue;
+                }
+                auto* rb = static_cast<std::byte*>(g_renderer);
+                Vec3 cur = read_vec3(rb, off);
+                if (std::fabs(cur.x - g_pos.x) < 8.f && std::fabs(cur.z - g_pos.z) < 8.f) {
+                    write_vec3(rb, off, eye);
+                }
+            }
+        }
+    }
+}
+
+static void tick_if_needed() {
+    static double last_tick = 0.0;
+    double t = now_sec();
+    float dt = last_tick > 0.0 ? static_cast<float>(t - last_tick) : (1.0f / 60.0f);
+    if (dt < 0.002f) {
+        return;
+    }
+    last_tick = t;
+    tick_move(std::clamp(dt, 0.002f, 0.05f));
+}
+
+static unsigned long CameraAPI_tryGetFOV_hook(void* self) {
+    g_camera_api = self;
+    if (g_enabled && !g_cam && g_pos_off >= 0) {
+        find_game_camera(self);
+    }
+    if (g_enabled && g_cam_can_write && g_pos_off >= 0) {
+        write_camera_pos(Vec3{g_pos.x, g_pos.y + g_eye_y, g_pos.z});
+        apply_znear();
+    }
+    unsigned long original = CameraAPI_tryGetFOV_orig(self);
+    if (g_enabled) {
+        try_hook_packets();
+        static double last_bfs = 0.0;
+        if (!player_still_ok()) {
+            double t = now_sec();
+            if (t - last_bfs >= 0.25) {
+                last_bfs = t;
+                attach_player(self);
+            }
+        } else {
+            tick_if_needed();
+        }
+        if (g_cam && g_cam_pos_off >= 0 && g_pos_off >= 0) {
+            write_camera_pos(Vec3{g_pos.x, g_pos.y + g_eye_y, g_pos.z});
+        }
+        if (g_logged < 3) {
+            ++g_logged;
+            LOGI("enable tick player=%p cam=%p pos_off=0x%x", g_player, static_cast<void*>(g_cam), g_pos_off);
+        }
+    }
+    return original;
+}
+
+static bool is_shift(int key) {
+    return key == kKeyShift || key == 160 || key == 161 || key == 59 || key == 60;
+}
+
+static bool on_key(void* /*user*/, int keyCode, int action) {
+    if (g_rebinding) {
+        if (action == kActionPress && keyCode != 0) {
+            g_key = keyCode;
+            g_rebinding = false;
+            save_config();
+            std::snprintf(g_key_label, sizeof(g_key_label), "Bound to %s", key_name(g_key).c_str());
+            if (mcpelauncher_close_window) {
+                mcpelauncher_close_window("Freecam key");
+            }
+        }
+        return true;
+    }
+
+    if (keyCode == g_key && action != kActionRepeat) {
+        if (action == kActionPress) {
+            if (!g_enabled && !playing()) {
+                return false;
+            }
+            toggle();
+            return true;
+        }
+        return true;
+    }
+
+    if (!g_enabled || !playing()) {
+        return false;
+    }
+    bool down = action != kActionRelease;
+    if (keyCode == kKeyW) {
+        g_move_w = down;
+        return false;
+    }
+    if (keyCode == kKeyA) {
+        g_move_a = down;
+        return false;
+    }
+    if (keyCode == kKeyS) {
+        g_move_s = down;
+        return false;
+    }
+    if (keyCode == kKeyD) {
+        g_move_d = down;
+        return false;
+    }
+    if (keyCode == kKeySpace || keyCode == 62) {
+        g_move_up = down;
+        return false;
+    }
+    if (is_shift(keyCode)) {
+        g_move_down = down;
+        return false;
+    }
+    return false;
+}
+
+static void show_key_window() {
+    if (!mcpelauncher_show_window) {
+        return;
+    }
+    g_rebinding = true;
+    std::snprintf(g_key_label, sizeof(g_key_label), "Press a new key (current: %s)", key_name(g_key).c_str());
+    static Control controls[1];
+    controls[0].type = 3;
+    controls[0].data.text.label = g_key_label;
+    controls[0].data.text.size = 0;
+    mcpelauncher_show_window(
+        "Freecam key", 1, nullptr,
+        [](void*) {
+            g_rebinding = false;
+            save_config();
+        },
+        1, controls);
+}
+
+static void show_settings_window() {
+    if (!mcpelauncher_show_window) {
+        return;
+    }
+    static Control c[1];
+    c[0].type = 2;
+    c[0].data.sliderfloat = {"Speed (blocks/s)", 0.5f, g_speed, 50.0f, nullptr, [](void*, float v) {
+                                 g_speed = v;
+                                 save_config();
+                             }};
+    mcpelauncher_show_window("Freecam settings", 0, nullptr, [](void*) { save_config(); }, 1, c);
+}
+
+static void init_menu() {
+    void* libmenu = dlopen("libmcpelauncher_menu.so", RTLD_NOW);
+    if (!libmenu) {
+        return;
+    }
+    mcpelauncher_show_window =
+        reinterpret_cast<decltype(mcpelauncher_show_window)>(dlsym(libmenu, "mcpelauncher_show_window"));
+    mcpelauncher_close_window =
+        reinterpret_cast<decltype(mcpelauncher_close_window)>(dlsym(libmenu, "mcpelauncher_close_window"));
+    mcpelauncher_addmenu = reinterpret_cast<decltype(mcpelauncher_addmenu)>(dlsym(libmenu, "mcpelauncher_addmenu"));
+    if (!mcpelauncher_addmenu) {
+        return;
+    }
+
+    static MenuEntryABI items[3]{};
+    items[0].name = "Change keybind";
+    items[0].click = [](void*) { show_key_window(); };
+    items[0].selected = [](void*) { return false; };
+    items[1].name = "Settings";
+    items[1].click = [](void*) { show_settings_window(); };
+    items[1].selected = [](void*) { return false; };
+    items[2].name = "Enabled";
+    items[2].click = [](void*) { toggle(); };
+    items[2].selected = [](void*) { return g_enabled; };
+
+    static MenuEntryABI menu{};
+    menu.name = "Freecam";
+    menu.length = 3;
+    menu.subentries = items;
+    mcpelauncher_addmenu(1, &menu);
+}
+
+static const std::byte* find_bytes(MemRange haystack, const void* needle, size_t needle_size) {
+    if (!haystack.data || haystack.size < needle_size) {
+        return nullptr;
+    }
+    return static_cast<const std::byte*>(memmem(haystack.data, haystack.size, needle, needle_size));
+}
+
+static const std::byte* find_pointer(MemRange haystack, const void* value) {
+    return find_bytes(haystack, &value, sizeof(value));
+}
+
+static bool collect_mc_ranges(void* mc_lib) {
+    g_readable.clear();
+    g_writable.clear();
+    auto visit = [&](const dl_phdr_info& info) -> int {
+        void* handle = dlopen(info.dlpi_name, RTLD_NOLOAD);
+        if (handle) {
+            dlclose(handle);
+        }
+        if (handle != mc_lib) {
+            return 0;
+        }
+        g_mc_base = static_cast<uintptr_t>(info.dlpi_addr);
+        for (int i = 0; i < info.dlpi_phnum; ++i) {
+            const auto& ph = info.dlpi_phdr[i];
+            if (ph.p_type != PT_LOAD || ph.p_memsz == 0) {
+                continue;
+            }
+            MemRange range{reinterpret_cast<std::byte*>(info.dlpi_addr + ph.p_vaddr), ph.p_memsz};
+            g_readable.push_back(range);
+            if (ph.p_flags & PF_W) {
+                g_writable.push_back(range);
+            }
+        }
+        return 1;
+    };
+    dl_iterate_phdr(
+        [](dl_phdr_info* info, size_t, void* data) { return (*static_cast<decltype(visit)*>(data))(*info); }, &visit);
+    return !g_readable.empty();
+}
+
+static void** find_primary_vtable(const char* typeinfo_name) {
+    const std::byte* name_addr = nullptr;
+    size_t nlen = std::strlen(typeinfo_name) + 1;
+    for (auto range : g_readable) {
+        name_addr = find_bytes(range, typeinfo_name, nlen);
+        if (name_addr) {
+            break;
+        }
+    }
+    if (!name_addr) {
+        return nullptr;
+    }
+    const std::byte* typeinfo = nullptr;
+    for (auto range : g_readable) {
+        const std::byte* hit = find_pointer(range, name_addr);
+        if (hit) {
+            typeinfo = hit - sizeof(void*);
+            break;
+        }
+    }
+    if (!typeinfo) {
+        return nullptr;
+    }
+
+    const std::byte* best = nullptr;
+    auto consider = [&](MemRange range) {
+        const std::byte* start = range.data;
+        const std::byte* end = range.data + range.size;
+        const auto* needle = reinterpret_cast<const std::byte*>(&typeinfo);
+        for (const std::byte* p = start; p + sizeof(void*) <= end; p += sizeof(void*)) {
+            if (std::memcmp(p, needle, sizeof(void*)) != 0 || p == typeinfo) {
+                continue;
+            }
+            intptr_t offset_to_top = 0;
+            if (p - sizeof(void*) >= start) {
+                std::memcpy(&offset_to_top, p - sizeof(void*), sizeof(offset_to_top));
+            }
+            if (offset_to_top != 0) {
+                continue;
+            }
+            best = p;
+            return true;
+        }
+        return false;
+    };
+    for (auto range : g_writable) {
+        if (consider(range)) {
+            break;
+        }
+    }
+    if (!best) {
+        for (auto range : g_readable) {
+            if (consider(range)) {
+                break;
+            }
+        }
+    }
+    if (!best) {
+        return nullptr;
+    }
+    return reinterpret_cast<void**>(const_cast<std::byte*>(best) + sizeof(void*));
+}
+
+static bool protect_slot(void** fn_slot) {
+    long page_size = sysconf(_SC_PAGESIZE);
+    auto page = reinterpret_cast<uintptr_t>(fn_slot) & ~(static_cast<uintptr_t>(page_size) - 1);
+    return mprotect(reinterpret_cast<void*>(page), page_size, PROT_READ | PROT_WRITE) == 0;
+}
+
+static bool hook_camera_api() {
+    void** vt = find_primary_vtable("9CameraAPI");
+    if (!vt) {
+        LOGE("Could not find CameraAPI primary vtable.");
+        return false;
+    }
+    void** fov_slot = vt + 7;
+    if (!protect_slot(fov_slot)) {
+        LOGE("mprotect on CameraAPI vtable failed.");
+        return false;
+    }
+    CameraAPI_tryGetFOV_orig = reinterpret_cast<decltype(CameraAPI_tryGetFOV_orig)>(*fov_slot);
+    if (!CameraAPI_tryGetFOV_orig) {
+        LOGE("CameraAPI::tryGetFOV slot was null.");
+        return false;
+    }
+    *fov_slot = reinterpret_cast<void*>(&CameraAPI_tryGetFOV_hook);
+    LOGI("Hooked CameraAPI::tryGetFOV orig=%p", reinterpret_cast<void*>(CameraAPI_tryGetFOV_orig));
+    return true;
+}
+
+static void on_window_created(void* /*user*/) {
+    void* window = game_window_get_primary_window();
+    if (!window) {
+        return;
+    }
+    game_window_add_keyboard_callback(window, nullptr, on_key);
+}
+
+extern "C" __attribute__((visibility("default"))) void mod_preinit() {}
+
+extern "C" __attribute__((visibility("default"))) void mod_init() {
+    LOGI("Loading freecam (noclip).");
+    load_config();
+
+    void* gw = dlopen("libmcpelauncher_gamewindow.so", RTLD_NOW);
+    if (!gw) {
+        LOGE("dlopen libmcpelauncher_gamewindow.so failed: %s", dlerror());
+        return;
+    }
+    game_window_is_mouse_locked =
+        reinterpret_cast<decltype(game_window_is_mouse_locked)>(dlsym(gw, "game_window_is_mouse_locked"));
+    game_window_get_primary_window =
+        reinterpret_cast<decltype(game_window_get_primary_window)>(dlsym(gw, "game_window_get_primary_window"));
+    game_window_add_window_creation_callback = reinterpret_cast<decltype(game_window_add_window_creation_callback)>(
+        dlsym(gw, "game_window_add_window_creation_callback"));
+    game_window_add_keyboard_callback =
+        reinterpret_cast<decltype(game_window_add_keyboard_callback)>(dlsym(gw, "game_window_add_keyboard_callback"));
+
+    void* mc = dlopen("libminecraftpe.so", RTLD_NOLOAD);
+    if (!mc) {
+        mc = dlopen("libminecraftpe.so", RTLD_NOW);
+    }
+    if (!mc || !collect_mc_ranges(mc) || !hook_camera_api()) {
+        return;
+    }
+
+    init_menu();
+    game_window_add_window_creation_callback(nullptr, on_window_created);
+    LOGI("Freecam ready. Toggle with %s.", key_name(g_key).c_str());
+}
